@@ -1,0 +1,39 @@
+{
+  "type": "object",
+  "properties": {
+    "loop_signal": {
+      "type": "string",
+      "enum": ["CONTINUE", "SHOULDNT_CONTINUE"]
+    },
+    "decision_reason": {
+      "type": "string"
+    },
+    "iteration_summary": {
+      "type": "string"
+    },
+    "review_outcome": {
+      "type": "string",
+      "enum": ["DONE", "NOT_DONE", "UNKNOWN"]
+    },
+    "worker_id": {
+      "type": "string"
+    },
+    "commit_status": {
+      "type": "string",
+      "enum": ["COMMITTED", "NO_CHANGES", "SKIPPED", "UNKNOWN"]
+    },
+    "commit_sha": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "loop_signal",
+    "decision_reason",
+    "iteration_summary",
+    "review_outcome",
+    "worker_id",
+    "commit_status",
+    "commit_sha"
+  ],
+  "additionalProperties": false
+}
