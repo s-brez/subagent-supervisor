@@ -76,6 +76,13 @@ JSON
     emit_jsonl
     exit 0
     ;;
+  INVALID_SHAPE)
+    cat >"${OUTPUT_FILE}" <<'JSON'
+{"loop_signal":"CONTINUE"}
+JSON
+    emit_jsonl
+    exit 0
+    ;;
 esac
 
 LOOP_SIGNAL="${FIRST}"

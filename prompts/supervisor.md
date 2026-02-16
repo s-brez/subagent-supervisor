@@ -12,6 +12,8 @@ Hard constraints:
 3. Always close the worker before ending your turn.
 4. If `wait` times out, keep waiting (do not busy-poll with tiny timeouts).
 5. Return a single JSON object matching the provided output schema.
+6. Do not emit interim status updates, draft JSON, or extra commentary at any point.
+7. Emit exactly one final JSON object only after worker handling is complete.
 
 Process to execute now:
 1. Spawn one worker with the exact `WORKER_REVIEW_PROMPT` text below.

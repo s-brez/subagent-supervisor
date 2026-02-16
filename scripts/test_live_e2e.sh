@@ -19,6 +19,43 @@ fi
 TMP_ROOT=$(mktemp -d)
 trap 'rm -rf "${TMP_ROOT}"' EXIT
 
+assert_live_collab_lifecycle() {
+  local ws="$1"
+  local log
+  local logs=("${ws}"/.orchestrator/logs/supervisor_iter_*.jsonl)
+
+  [[ -e "${logs[0]}" ]]
+
+  for log in "${logs[@]}"; do
+    mapfile -t tools < <(
+      jq -r '
+        if (.type == "item.completed" and .item.type == "collab_tool_call")
+        then .item.tool
+        else empty
+        end
+      ' "${log}"
+    )
+
+    [[ "${#tools[@]}" -ge 1 ]]
+
+    local spawn_idx=-1
+    local close_idx=-1
+    local i
+    for i in "${!tools[@]}"; do
+      if [[ "${tools[$i]}" == "spawn_agent" && "${spawn_idx}" -lt 0 ]]; then
+        spawn_idx="${i}"
+      fi
+      if [[ "${tools[$i]}" == "close_agent" ]]; then
+        close_idx="${i}"
+      fi
+    done
+
+    [[ "${spawn_idx}" -ge 0 ]]
+    [[ "${close_idx}" -ge 0 ]]
+    [[ "${close_idx}" -gt "${spawn_idx}" ]]
+  done
+}
+
 run_live_normal_path_test() {
   local ws="${TMP_ROOT}/ws-live-normal"
   "${SETUP_SCRIPT}" "${ws}" >/dev/null
@@ -36,8 +73,9 @@ run_live_normal_path_test() {
 
   [[ "${last_signal}" == "SHOULDNT_CONTINUE" ]]
   [[ "${continue_count}" -ge 1 ]]
+  assert_live_collab_lifecycle "${ws}"
 
-  echo "PASS: live normal path reached CONTINUE and then SHOULDNT_CONTINUE"
+  echo "PASS: live normal path reached CONTINUE -> SHOULDNT_CONTINUE and used spawn/close lifecycle"
 }
 
 run_live_max_loop_path_test() {
@@ -70,8 +108,9 @@ JSON
   s2=$(sed -n '2p' "${history}" | jq -r '.loop_signal')
   [[ "${s1}" == "CONTINUE" ]]
   [[ "${s2}" == "CONTINUE" ]]
+  assert_live_collab_lifecycle "${ws}"
 
-  echo "PASS: live max-loop path hit repeated CONTINUE and exited with 14"
+  echo "PASS: live max-loop path hit repeated CONTINUE, exited 14, and used spawn/close lifecycle"
 }
 
 run_live_normal_path_test

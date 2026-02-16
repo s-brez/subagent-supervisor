@@ -62,7 +62,41 @@ run_error_branch_tests() {
     --workspace "${TMP_ROOT}/ws-schema-missing" >"${TMP_ROOT}/schema-missing.out" 2>"${err_file}"
   grep -q "Schema not found" "${err_file}"
 
-  echo "PASS: harness preflight error branches (unknown arg, jq missing, workspace missing, schema missing)"
+  local prompt_missing_copy_root="${TMP_ROOT}/prompt-missing-copy"
+  cp -R "${EXAMPLE_DIR}" "${prompt_missing_copy_root}"
+  rm -f "${prompt_missing_copy_root}/prompts/worker_review.md"
+  setup_workspace "${TMP_ROOT}/ws-prompt-missing"
+  err_file="${TMP_ROOT}/prompt-missing.err"
+  assert_exit_code 2 "${prompt_missing_copy_root}/scripts/run_supervisor_loop.sh" \
+    --workspace "${TMP_ROOT}/ws-prompt-missing" >"${TMP_ROOT}/prompt-missing.out" 2>"${err_file}"
+  grep -q "Worker review prompt not found" "${err_file}"
+
+  local prompt_empty_copy_root="${TMP_ROOT}/prompt-empty-copy"
+  cp -R "${EXAMPLE_DIR}" "${prompt_empty_copy_root}"
+  : >"${prompt_empty_copy_root}/prompts/worker_commit.md"
+  setup_workspace "${TMP_ROOT}/ws-prompt-empty"
+  err_file="${TMP_ROOT}/prompt-empty.err"
+  assert_exit_code 2 "${prompt_empty_copy_root}/scripts/run_supervisor_loop.sh" \
+    --workspace "${TMP_ROOT}/ws-prompt-empty" >"${TMP_ROOT}/prompt-empty.out" 2>"${err_file}"
+  grep -q "Worker commit prompt is empty" "${err_file}"
+
+  local task_spec_copy_root="${TMP_ROOT}/task-spec-missing-copy"
+  cp -R "${EXAMPLE_DIR}" "${task_spec_copy_root}"
+  rm -f "${task_spec_copy_root}/demo/task_spec.md"
+  setup_workspace "${TMP_ROOT}/ws-task-spec-missing"
+  err_file="${TMP_ROOT}/task-spec-missing.err"
+  assert_exit_code 2 "${task_spec_copy_root}/scripts/run_supervisor_loop.sh" \
+    --workspace "${TMP_ROOT}/ws-task-spec-missing" >"${TMP_ROOT}/task-spec-missing.out" 2>"${err_file}"
+  grep -q "Task spec not found" "${err_file}"
+
+  err_file="${TMP_ROOT}/history-metadata-invalid.err"
+  setup_workspace "${TMP_ROOT}/ws-history-invalid"
+  assert_exit_code 2 "${HARNESS_SCRIPT}" \
+    --workspace "${TMP_ROOT}/ws-history-invalid" \
+    --history-metadata-json '["not-an-object"]' >"${TMP_ROOT}/history-metadata-invalid.out" 2>"${err_file}"
+  grep -q "history metadata must be a JSON object" "${err_file}"
+
+  echo "PASS: harness preflight error branches (args, deps, files, prompt assets, metadata)"
 }
 
 run_main_path_test() {
@@ -153,6 +187,30 @@ run_restart_context_branch_test() {
   echo "PASS: restart branch reuses prior supervisor output context"
 }
 
+run_restart_state_recovery_test() {
+  local ws="${TMP_ROOT}/ws-restart-state-recovery"
+  setup_workspace "${ws}"
+
+  mkdir -p "${ws}/.orchestrator/state"
+  printf '{broken json' >"${ws}/.orchestrator/state/last_supervisor_output.json"
+
+  FAKE_CODEX_SEQUENCE="SHOULDNT_CONTINUE" \
+    "${HARNESS_SCRIPT}" \
+    --workspace "${ws}" \
+    --max-loops 1 \
+    --codex-bin "${FAKE_CODEX}" \
+    --model "fake-model" >"${TMP_ROOT}/restart-state-recovery.out" 2>"${TMP_ROOT}/restart-state-recovery.err"
+
+  grep -q "using bootstrap context" "${TMP_ROOT}/restart-state-recovery.err"
+  grep -Fq '"decision_reason":"bootstrap"' "${ws}/.orchestrator/tmp/supervisor_prompt_iter_1.md"
+
+  local recovered_count
+  recovered_count=$(find "${ws}/.orchestrator/state" -maxdepth 1 -name 'last_supervisor_output.json.invalid.*' | wc -l)
+  [[ "${recovered_count}" -ge 1 ]]
+
+  echo "PASS: invalid prior state is quarantined and bootstrap context is used"
+}
+
 run_runtime_failure_branch_tests() {
   local ws
 
@@ -183,6 +241,15 @@ run_runtime_failure_branch_tests() {
     --model "fake-model" >/dev/null 2>"${TMP_ROOT}/invalid-json.err"
   grep -q "Supervisor output is not valid JSON" "${TMP_ROOT}/invalid-json.err"
 
+  ws="${TMP_ROOT}/ws-invalid-shape"
+  setup_workspace "${ws}"
+  assert_exit_code 12 env FAKE_CODEX_SEQUENCE="INVALID_SHAPE" "${HARNESS_SCRIPT}" \
+    --workspace "${ws}" \
+    --max-loops 1 \
+    --codex-bin "${FAKE_CODEX}" \
+    --model "fake-model" >/dev/null 2>"${TMP_ROOT}/invalid-shape.err"
+  grep -q "does not match expected contract" "${TMP_ROOT}/invalid-shape.err"
+
   ws="${TMP_ROOT}/ws-invalid-signal"
   setup_workspace "${ws}"
   assert_exit_code 13 env FAKE_CODEX_SEQUENCE="INVALID_SIGNAL" "${HARNESS_SCRIPT}" \
@@ -192,7 +259,7 @@ run_runtime_failure_branch_tests() {
     --model "fake-model" >/dev/null 2>"${TMP_ROOT}/invalid-signal.err"
   grep -q "Invalid loop_signal" "${TMP_ROOT}/invalid-signal.err"
 
-  echo "PASS: runtime failure branches (cmd fail, missing output, invalid json, invalid signal)"
+  echo "PASS: runtime failure branches (cmd fail, missing output, invalid json/shape, invalid signal)"
 }
 
 run_max_loop_guard_test() {
@@ -241,12 +308,38 @@ run_fake_codex_script_branch_tests() {
   echo "PASS: fake codex script branches (missing arg and empty-sequence fallback)"
 }
 
+run_history_metadata_extension_test() {
+  local ws="${TMP_ROOT}/ws-history-metadata"
+  setup_workspace "${ws}"
+
+  FAKE_CODEX_SEQUENCE="SHOULDNT_CONTINUE" \
+    "${HARNESS_SCRIPT}" \
+    --workspace "${ws}" \
+    --max-loops 1 \
+    --codex-bin "${FAKE_CODEX}" \
+    --model "fake-model" \
+    --history-metadata-json '{"run_id":"deterministic-test","suite":"e2e"}' >/dev/null
+
+  local history="${ws}/.orchestrator/state/supervisor_history.jsonl"
+  local run_id
+  run_id=$(sed -n '1p' "${history}" | jq -r '.history_metadata_extra.run_id')
+  [[ "${run_id}" == "deterministic-test" ]]
+
+  local prompt_path
+  prompt_path=$(sed -n '1p' "${history}" | jq -r '.history_metadata.prompt_paths.worker_review')
+  [[ "${prompt_path}" == */prompts/worker_review.md ]]
+
+  echo "PASS: history metadata extension and prompt-path metadata recorded"
+}
+
 run_error_branch_tests
 run_main_path_test
 run_unknown_fallback_path_test
 run_restart_context_branch_test
+run_restart_state_recovery_test
 run_runtime_failure_branch_tests
 run_max_loop_guard_test
 run_fake_codex_script_branch_tests
+run_history_metadata_extension_test
 
 echo "All e2e tests passed (including error and fallback branches)"

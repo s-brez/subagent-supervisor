@@ -3,7 +3,12 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 EXAMPLE_DIR=$(cd -- "${SCRIPT_DIR}/.." && pwd)
+
 PROMPTS_DIR="${EXAMPLE_DIR}/prompts"
+SUPERVISOR_PROMPT_PATH="${PROMPTS_DIR}/supervisor.md"
+WORKER_REVIEW_PROMPT_PATH="${PROMPTS_DIR}/worker_review.md"
+WORKER_IMPLEMENT_PROMPT_PATH="${PROMPTS_DIR}/worker_implement.md"
+WORKER_COMMIT_PROMPT_PATH="${PROMPTS_DIR}/worker_commit.md"
 SCHEMA_PATH="${EXAMPLE_DIR}/schemas/supervisor_output.schema.json"
 TASK_SPEC_PATH="${EXAMPLE_DIR}/demo/task_spec.md"
 
@@ -11,6 +16,104 @@ WORKSPACE="$(pwd)"
 MAX_LOOPS=8
 MODEL="gpt-5.3-codex"
 CODEX_BIN="codex"
+HISTORY_METADATA_JSON='{}'
+
+BOOTSTRAP_OUTPUT_JSON='{"loop_signal":"CONTINUE","decision_reason":"bootstrap","iteration_summary":"first run","review_outcome":"UNKNOWN","worker_id":"","commit_status":"UNKNOWN","commit_sha":""}'
+
+print_usage() {
+  cat <<'USAGE'
+Usage: run_supervisor_loop.sh [options]
+
+Options:
+  --workspace PATH
+  --max-loops N
+  --model NAME
+  --codex-bin PATH
+  --prompts-dir PATH
+  --supervisor-prompt PATH
+  --worker-review-prompt PATH
+  --worker-implement-prompt PATH
+  --worker-commit-prompt PATH
+  --schema-path PATH
+  --task-spec-path PATH
+  --history-metadata-json JSON_OBJECT
+  --history-metadata-file PATH
+  --help
+USAGE
+}
+
+require_nonempty_file() {
+  local path="$1"
+  local label="$2"
+
+  if [[ ! -f "${path}" ]]; then
+    echo "${label} not found: ${path}" >&2
+    exit 2
+  fi
+
+  if [[ ! -s "${path}" ]]; then
+    echo "${label} is empty: ${path}" >&2
+    exit 2
+  fi
+}
+
+validate_supervisor_output_contract() {
+  local output_path="$1"
+
+  jq -e '
+    type == "object" and
+    (
+      (keys | sort) ==
+      ["commit_sha","commit_status","decision_reason","iteration_summary","loop_signal","review_outcome","worker_id"]
+    ) and
+    (.loop_signal | type == "string") and
+    (.decision_reason | type == "string") and
+    (.iteration_summary | type == "string") and
+    (.review_outcome == "DONE" or .review_outcome == "NOT_DONE" or .review_outcome == "UNKNOWN") and
+    (.worker_id | type == "string") and
+    (.commit_status == "COMMITTED" or .commit_status == "NO_CHANGES" or .commit_status == "SKIPPED" or .commit_status == "UNKNOWN") and
+    (.commit_sha | type == "string")
+  ' "${output_path}" >/dev/null
+}
+
+append_history_record() {
+  local iteration="$1"
+  local output_path="$2"
+  local timestamp_utc
+  timestamp_utc=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  jq -c \
+    --argjson iteration "${iteration}" \
+    --arg timestamp_utc "${timestamp_utc}" \
+    --arg workspace "${WORKSPACE}" \
+    --arg model "${MODEL}" \
+    --arg schema_path "${SCHEMA_PATH}" \
+    --arg task_spec_path "${TASK_SPEC_PATH}" \
+    --arg supervisor_prompt_path "${SUPERVISOR_PROMPT_PATH}" \
+    --arg worker_review_prompt_path "${WORKER_REVIEW_PROMPT_PATH}" \
+    --arg worker_implement_prompt_path "${WORKER_IMPLEMENT_PROMPT_PATH}" \
+    --arg worker_commit_prompt_path "${WORKER_COMMIT_PROMPT_PATH}" \
+    --argjson history_extra "${HISTORY_METADATA_JSON}" \
+    '
+      . + {
+        iteration: $iteration,
+        history_metadata: {
+          timestamp_utc: $timestamp_utc,
+          workspace: $workspace,
+          model: $model,
+          schema_path: $schema_path,
+          task_spec_path: $task_spec_path,
+          prompt_paths: {
+            supervisor: $supervisor_prompt_path,
+            worker_review: $worker_review_prompt_path,
+            worker_implement: $worker_implement_prompt_path,
+            worker_commit: $worker_commit_prompt_path
+          }
+        }
+      } +
+      (if ($history_extra | length) > 0 then {history_metadata_extra: $history_extra} else {} end)
+    ' "${output_path}" >>"${HISTORY_PATH}"
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -30,6 +133,50 @@ while [[ $# -gt 0 ]]; do
       CODEX_BIN="$2"
       shift 2
       ;;
+    --prompts-dir)
+      PROMPTS_DIR="$2"
+      SUPERVISOR_PROMPT_PATH="${PROMPTS_DIR}/supervisor.md"
+      WORKER_REVIEW_PROMPT_PATH="${PROMPTS_DIR}/worker_review.md"
+      WORKER_IMPLEMENT_PROMPT_PATH="${PROMPTS_DIR}/worker_implement.md"
+      WORKER_COMMIT_PROMPT_PATH="${PROMPTS_DIR}/worker_commit.md"
+      shift 2
+      ;;
+    --supervisor-prompt)
+      SUPERVISOR_PROMPT_PATH="$2"
+      shift 2
+      ;;
+    --worker-review-prompt)
+      WORKER_REVIEW_PROMPT_PATH="$2"
+      shift 2
+      ;;
+    --worker-implement-prompt)
+      WORKER_IMPLEMENT_PROMPT_PATH="$2"
+      shift 2
+      ;;
+    --worker-commit-prompt)
+      WORKER_COMMIT_PROMPT_PATH="$2"
+      shift 2
+      ;;
+    --schema-path)
+      SCHEMA_PATH="$2"
+      shift 2
+      ;;
+    --task-spec-path)
+      TASK_SPEC_PATH="$2"
+      shift 2
+      ;;
+    --history-metadata-json)
+      HISTORY_METADATA_JSON="$2"
+      shift 2
+      ;;
+    --history-metadata-file)
+      HISTORY_METADATA_JSON=$(cat "$2")
+      shift 2
+      ;;
+    --help)
+      print_usage
+      exit 0
+      ;;
     *)
       echo "Unknown argument: $1" >&2
       exit 2
@@ -47,10 +194,17 @@ if [[ ! -d "${WORKSPACE}" ]]; then
   exit 2
 fi
 
-if [[ ! -f "${SCHEMA_PATH}" ]]; then
-  echo "Schema not found: ${SCHEMA_PATH}" >&2
+if ! jq -e 'type == "object"' <<<"${HISTORY_METADATA_JSON}" >/dev/null; then
+  echo "history metadata must be a JSON object" >&2
   exit 2
 fi
+
+require_nonempty_file "${SCHEMA_PATH}" "Schema"
+require_nonempty_file "${TASK_SPEC_PATH}" "Task spec"
+require_nonempty_file "${SUPERVISOR_PROMPT_PATH}" "Supervisor prompt"
+require_nonempty_file "${WORKER_REVIEW_PROMPT_PATH}" "Worker review prompt"
+require_nonempty_file "${WORKER_IMPLEMENT_PROMPT_PATH}" "Worker implement prompt"
+require_nonempty_file "${WORKER_COMMIT_PROMPT_PATH}" "Worker commit prompt"
 
 STATE_ROOT="${WORKSPACE}/.orchestrator"
 LOG_DIR="${STATE_ROOT}/logs"
@@ -63,23 +217,31 @@ mkdir -p "${LOG_DIR}" "${TMP_DIR}" "${STATE_DIR}" "${WORKSPACE}/.orchestrator_as
 cp "${TASK_SPEC_PATH}" "${WORKSPACE}/.orchestrator_assets/task_spec.md"
 
 if [[ -f "${LAST_OUTPUT_PATH}" ]]; then
-  PREV_OUTPUT_JSON=$(jq -c . "${LAST_OUTPUT_PATH}")
+  if PREV_OUTPUT_JSON=$(jq -ce 'if type == "object" then . else error("not object") end' "${LAST_OUTPUT_PATH}" 2>/dev/null); then
+    :
+  else
+    INVALID_LAST_OUTPUT_PATH="${LAST_OUTPUT_PATH}.invalid.$(date -u +%Y%m%dT%H%M%SZ)"
+    mv "${LAST_OUTPUT_PATH}" "${INVALID_LAST_OUTPUT_PATH}"
+    echo "Warning: invalid previous supervisor output JSON moved to ${INVALID_LAST_OUTPUT_PATH}; using bootstrap context" >&2
+    PREV_OUTPUT_JSON="${BOOTSTRAP_OUTPUT_JSON}"
+  fi
 else
-  PREV_OUTPUT_JSON='{"loop_signal":"CONTINUE","decision_reason":"bootstrap","iteration_summary":"first run","review_outcome":"UNKNOWN","worker_id":"","commit_status":"UNKNOWN","commit_sha":""}'
+  PREV_OUTPUT_JSON="${BOOTSTRAP_OUTPUT_JSON}"
 fi
 
 render_prompt() {
   local iteration="$1"
   local previous_json="$2"
   local prompt_file="$3"
+  local supervisor_prompt_file="$4"
 
   awk \
     -v iteration="${iteration}" \
     -v workspace="${WORKSPACE}" \
     -v previous_json="${previous_json}" \
-    -v review_file="${PROMPTS_DIR}/worker_review.md" \
-    -v implement_file="${PROMPTS_DIR}/worker_implement.md" \
-    -v commit_file="${PROMPTS_DIR}/worker_commit.md" \
+    -v review_file="${WORKER_REVIEW_PROMPT_PATH}" \
+    -v implement_file="${WORKER_IMPLEMENT_PROMPT_PATH}" \
+    -v commit_file="${WORKER_COMMIT_PROMPT_PATH}" \
     '
       function slurp(path,    line, text) {
         text = ""
@@ -122,7 +284,7 @@ render_prompt() {
 
         print line
       }
-    ' "${PROMPTS_DIR}/supervisor.md" >"${prompt_file}"
+    ' "${supervisor_prompt_file}" >"${prompt_file}"
 }
 
 ITER=1
@@ -132,7 +294,7 @@ while (( ITER <= MAX_LOOPS )); do
   JSONL_LOG="${LOG_DIR}/supervisor_iter_${ITER}.jsonl"
   STDERR_LOG="${LOG_DIR}/supervisor_iter_${ITER}.stderr.log"
 
-  render_prompt "${ITER}" "${PREV_OUTPUT_JSON}" "${PROMPT_FILE}"
+  render_prompt "${ITER}" "${PREV_OUTPUT_JSON}" "${PROMPT_FILE}" "${SUPERVISOR_PROMPT_PATH}"
 
   echo "[loop] iteration ${ITER}/${MAX_LOOPS}"
 
@@ -166,9 +328,14 @@ while (( ITER <= MAX_LOOPS )); do
     exit 12
   fi
 
+  if ! validate_supervisor_output_contract "${OUTPUT_FILE}"; then
+    echo "Supervisor output does not match expected contract: ${OUTPUT_FILE}" >&2
+    exit 12
+  fi
+
   cp "${OUTPUT_FILE}" "${LAST_OUTPUT_PATH}"
   PREV_OUTPUT_JSON=$(jq -c . "${OUTPUT_FILE}")
-  jq -c --argjson iteration "${ITER}" '. + {iteration: $iteration}' "${OUTPUT_FILE}" >>"${HISTORY_PATH}"
+  append_history_record "${ITER}" "${OUTPUT_FILE}"
 
   LOOP_SIGNAL=$(jq -r '.loop_signal' "${OUTPUT_FILE}")
   echo "[loop] signal=${LOOP_SIGNAL}"
